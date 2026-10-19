@@ -6,6 +6,7 @@ Advanced API Endpoint Discovery Tool
 - Probes common paths with status codes
 - Supports custom headers
 - Outputs JSON / HTML report
+- Optional safe security checks (--security)
 """
 
 import argparse
@@ -50,6 +51,24 @@ COMMON_PATHS = [
     "/users", "/auth", "/login", "/token",
 ]
 
+SENSITIVE_PATHS = [
+    "/.env", "/.env.local", "/.env.production", "/.git/config", "/.git/HEAD",
+    "/backup", "/backup.zip", "/backup.tar.gz", "/db.sql", "/dump.sql",
+    "/config.json", "/config.php", "/wp-config.php", "/web.config",
+    "/admin", "/administrator", "/phpinfo.php", "/server-status",
+    "/debug", "/trace", "/actuator", "/actuator/env", "/actuator/health",
+    "/.DS_Store", "/robots.txt", "/sitemap.xml",
+]
+
+SECURITY_HEADERS = [
+    "strict-transport-security",
+    "content-security-policy",
+    "x-frame-options",
+    "x-content-type-options",
+    "referrer-policy",
+    "permissions-policy",
+]
+
 
 class LinkExtractor(HTMLParser):
     def __init__(self):
@@ -66,7 +85,6 @@ class LinkExtractor(HTMLParser):
 
 
 def fetch(url: str, headers: Dict = None, timeout: int = 12) -> tuple:
-    """Returns (status, body, final_url)"""
     hdrs = {"User-Agent": USER_AGENT}
     if headers:
         hdrs.update(headers)
@@ -100,8 +118,42 @@ def extract_endpoints(text: str, base_url: str) -> Set[str]:
 
 def probe_path(base: str, path: str, headers: Dict) -> Dict:
     url = urllib.parse.urljoin(base, path)
-    status, _, final = fetch(url, headers, timeout=8)
-    return {"url": url, "status": status, "final": final}
+    status, body, final = fetch(url, headers, timeout=8)
+    return {"url": url, "status": status, "final": final, "body_snippet": body[:200] if body else ""}
+
+
+def check_security_headers(url: str, headers: Dict) -> Dict:
+    req = urllib.request.Request(url, headers={**{"User-Agent": USER_AGENT}, **(headers or {})}, method="HEAD")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp_headers = {k.lower(): v for k, v in resp.headers.items()}
+            missing = [h for h in SECURITY_HEADERS if h not in resp_headers]
+            return {
+                "url": url,
+                "status": resp.status,
+                "missing_headers": missing,
+                "present_headers": {h: resp_headers.get(h) for h in SECURITY_HEADERS if h in resp_headers},
+            }
+    except Exception as e:
+        return {"url": url, "error": str(e), "missing_headers": SECURITY_HEADERS}
+
+
+def run_security_checks(base: str, headers: Dict, workers: int) -> Dict:
+    findings = {"sensitive_paths": [], "missing_headers": [], "notes": []}
+    print("\n[*] Running security checks (authorized use only)...")
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = [ex.submit(probe_path, base, p, headers) for p in SENSITIVE_PATHS]
+        for fut in as_completed(futures):
+            r = fut.result()
+            if r["status"] and r["status"] < 400:
+                findings["sensitive_paths"].append(r)
+                print(f"  [!] Exposed: [{r['status']}] {r['url']}")
+    header_result = check_security_headers(base, headers)
+    if header_result.get("missing_headers"):
+        findings["missing_headers"] = header_result["missing_headers"]
+        print(f"  [!] Missing security headers: {', '.join(header_result['missing_headers'])}")
+    findings["notes"].append("These are configuration checks only. No exploit payloads were sent.")
+    return findings
 
 
 def main():
@@ -115,6 +167,8 @@ def main():
     parser.add_argument("--output", "-o", help="Save JSON report")
     parser.add_argument("--html", help="Save HTML report")
     parser.add_argument("--delay", type=float, default=0.2, help="Delay between requests")
+    parser.add_argument("--security", action="store_true",
+                        help="Run safe security checks (sensitive paths + header analysis). Authorized use only.")
     args = parser.parse_args()
 
     base = args.url.rstrip("/")
@@ -189,6 +243,10 @@ def main():
                     probed.append(r)
                     print(f"  [{r['status']}] {r['url']}")
 
+    security = {}
+    if args.security:
+        security = run_security_checks(base, headers, args.workers)
+
     print("\n" + "=" * 50)
     print(f"Discovered endpoints from source: {len(all_endpoints)}")
     for ep in sorted(all_endpoints):
@@ -204,6 +262,7 @@ def main():
         "timestamp": datetime.now().isoformat(),
         "from_source": sorted(all_endpoints),
         "probed": probed,
+        "security": security,
     }
 
     if args.output:
@@ -211,9 +270,21 @@ def main():
         print(f"\n[*] JSON saved: {args.output}")
 
     if args.html:
+        sec_html = ""
+        if security:
+            sec_html = "<h2>Security Checks</h2>"
+            if security.get("sensitive_paths"):
+                sec_html += "<h3>Exposed sensitive paths</h3><ul>"
+                for p in security["sensitive_paths"]:
+                    sec_html += f'<li>[{p["status"]}] <a href="{p["url"]}">{p["url"]}</a></li>'
+                sec_html += "</ul>"
+            if security.get("missing_headers"):
+                sec_html += f"<p>Missing headers: {', '.join(security['missing_headers'])}</p>"
+            sec_html += "<p><em>Authorized use only. Configuration checks only \u2014 no exploit payloads.</em></p>"
+
         html = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>API Discovery - {base}</title>
-<style>body{{font-family:sans-serif;margin:2em}} li{{margin:4px 0}} .ok{{color:green}} .auth{{color:orange}}</style>
+<style>body{{font-family:sans-serif;margin:2em}} li{{margin:4px 0}} .ok{{color:green}} .auth{{color:orange}} .warn{{color:red}}</style>
 </head><body>
 <h1>API Discovery Report</h1>
 <p>Target: <a href="{base}">{base}</a></p>
@@ -222,6 +293,7 @@ def main():
 <ul>{''.join(f'<li><a href="{e}">{e}</a></li>' for e in sorted(all_endpoints))}</ul>
 <h2>Probed ({len(probed)})</h2>
 <ul>{''.join(f'<li class="{"ok" if p["status"]<400 else "auth"}">[{p["status"]}] <a href="{p["url"]}">{p["url"]}</a></li>' for p in probed)}</ul>
+{sec_html}
 </body></html>"""
         Path(args.html).write_text(html)
         print(f"[*] HTML saved: {args.html}")
